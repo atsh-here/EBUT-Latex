@@ -409,7 +409,7 @@ The client proves knowledge of a valid master token and correct derivation of $N
 The server performs the following checks in order:
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Epoch check:} $T$ must equal the current epoch (or be within a small grace window).
-\item \textbf{Nullifier freshness:} $N_T \notin \DB_{\mathsf{epoch}}$ and $N_T \neq 1_{\mathbb{G}_1}$. Atomically insert $N_T$ if fresh.
+\item \textbf{Nullifier freshness check (read-only):} $N_T \notin \DB_{\mathsf{epoch}}$ and $N_T \neq 1_{\mathbb{G}_1}$. \textbf{Do not insert $N_T$ at this step.} Inserting before the proofs are verified creates a TOCTOU vulnerability: an adversary can submit a valid $N_T$ with garbage ZK proofs, causing the server to burn the legitimate user's epoch nullifier in step~2 and then abort during proof verification, permanently locking the user out for the entire epoch.
 \item \textbf{Basic bounds:} $A' \neq 1_{\mathbb{G}_1}$ and $T_{\mathsf{BBS}} \neq 1_{\mathbb{G}_1}$.
 \item \textbf{Expiry bridge:} $C_{\mathsf{bridge}} \stackrel{?}{=} C_{\Delta} + T \cdot h_3$.
 \item \textbf{Recompute challenge $c$} from the received values (including $H_{\mathsf{ctx}}$ and $\mathsf{pk}_S$).
@@ -428,6 +428,7 @@ The server performs the following checks in order:
   \[
   e(A', \mathsf{pk}_S) \stackrel{?}{=} e(\bar{A}, g_2).
   \]
+\item \textbf{Atomic state mutation (step 10, LAST):} Only after all checks in steps~1--9 pass: atomically insert $N_T$ into $\DB_{\mathsf{epoch}}$ (reject if already present, indicating a concurrent duplicate or replay). This deferred write ensures that a request with a valid $N_T$ but invalid proofs cannot permanently burn the epoch nullifier of a legitimate user.
 \end{enumerate}
 
 If all checks pass, the server issues a daily token by choosing $e_{\mathsf{daily}}, s'_{\mathsf{daily}} \xleftarrow{\$} \mathbb{Z}_q$ and computing
@@ -614,18 +615,26 @@ and that $m \in [0, 2^{32}-1]$.
 \textbf{Input:} $m \in [0, 2^{32}-1]$, $r_{\text{BLS}} \in \mathbb{Z}_{q_{\text{BLS}}}$, $r_{25519} \in \mathbb{Z}_{q_{25519}}$, context string $\text{ctx}$, and optional auxiliary commitments $\text{comm}_1,\dots,\text{comm}_k \in \mathbb{G}_{\text{BLS}}$ (e.g., BBS+ proof components).
 
 \begin{enumerate}[leftmargin=*]
-\item \textbf{Commitments:}
-  Choose random integers
-  \[
-  u_m \xleftarrow{\$} [0, 2^{240}-1], \qquad
-  u_{\text{BLS}} \xleftarrow{\$} \mathbb{Z}_{q_{\text{BLS}}}, \qquad
-  u_{25519} \xleftarrow{\$} \mathbb{Z}_{q_{25519}}.
-  \]
-  Compute
-  \[
-  R_{\text{BLS}} = u_m \cdot h_4 + u_{\text{BLS}} \cdot h_0 \in \mathbb{G}_{\text{BLS}}, \qquad
-  R_{25519} = u_m \cdot G + u_{25519} \cdot H \in \mathbb{G}_{25519}.
-  \]
+\item \textbf{Commitments (with rejection sampling):}
+  Repeat the following until acceptance:
+  \begin{enumerate}
+  \item Choose random integers
+    \[
+    u_m \xleftarrow{\$} [0, 2^{240}-1], \qquad
+    u_{\text{BLS}} \xleftarrow{\$} \mathbb{Z}_{q_{\text{BLS}}}, \qquad
+    u_{25519} \xleftarrow{\$} \mathbb{Z}_{q_{25519}}.
+    \]
+  \item Compute
+    \[
+    R_{\text{BLS}} = u_m \cdot h_4 + u_{\text{BLS}} \cdot h_0 \in \mathbb{G}_{\text{BLS}}, \qquad
+    R_{25519} = u_m \cdot G + u_{25519} \cdot H \in \mathbb{G}_{25519}.
+    \]
+  \item Compute the challenge $c$ as in step~3 below.
+  \item Set $z = u_m + c \cdot m$ (as an integer).
+  \item \textbf{Rejection test:} if $z > 2^{240}-1$, \textbf{abort and restart} from the beginning of this loop with fresh randomness.
+  \item Otherwise \textbf{accept} and continue.
+  \end{enumerate}
+  The expected number of iterations is less than~2; rejection occurs with probability at most $(2^{32}-1) \cdot (2^{128}-1) / 2^{240} < 2^{-80}$, where $c_{\max} \le 2^{32}-1$ per Section~4.1 and $c < 2^{128}$.
 
 \item \textbf{Range Proof:}
   Generate a Dalek Bulletproof $\pi_{\text{range}}$ for the Ristretto commitment $C_{25519}$ proving that $m \in [0, 2^{32}-1]$. The Bulletproof transcript is initialized with domain separator \texttt{"EBUT:BEQ:Range"} and includes $\text{ctx}$ and the serialized auxiliary commitments $\text{comm}_i$.
@@ -637,10 +646,7 @@ and that $m \in [0, 2^{32}-1]$.
   \]
 
 \item \textbf{Responses:}
-  Compute over the integers:
-  \[
-  z = u_m + c \cdot m \quad (\text{as an integer, not reduced modulo any group order}).
-  \]
+  Use the $z = u_m + c \cdot m$ accepted in step~1 (over the integers, not reduced modulo any group order).
   Compute modular responses:
   \[
   z_{\text{BLS}} = u_{\text{BLS}} + c \cdot r_{\text{BLS}} \pmod{q_{\text{BLS}}}, \qquad
@@ -658,7 +664,7 @@ and that $m \in [0, 2^{32}-1]$.
 
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Bound Check:}
-  Verify that $0 \le z < q_{25519}$ (as an integer). If not, reject.
+  Verify that $0 \le z \le 2^{240}-1$ (as an integer). If not, reject. This tighter bound (compared to checking only $z < q_{25519}$, where $q_{25519} \approx 2^{252}$) is enforced by the prover's rejection-sampling step and is required for the zero-knowledge guarantee: without it, a large $z > 2^{240}-1$ would reveal that $c \cdot m$ is large, leaking a lower bound on the secret $m$.
 
 \item \textbf{Recompute Challenge:}
   Compute $c = \mathcal{H}_{128}(\text{``EBUT:BEQ:Challenge''} \parallel \text{ctx} \parallel C_{\text{BLS}} \parallel C_{25519} \parallel R_{\text{BLS}} \parallel R_{25519} \parallel \pi_{\text{range}} \parallel \text{comm}_1 \parallel \dots)$.
@@ -685,7 +691,7 @@ If all checks pass, the verifier accepts.
 If the prover follows the protocol honestly, the verifier always accepts.
 \end{theorem}
 \begin{proof}
-The integer $z = u_m + c \cdot m$ satisfies $0 \le z < 2^{241} < q_{25519}$ by construction, so the bound check passes. Substituting the definitions:
+The rejection-sampling loop guarantees that the accepted $z = u_m + c \cdot m$ satisfies $0 \le z \le 2^{240}-1 < q_{25519}$ (where $q_{25519} = 2^{252} + 27742317777372353535851937790883648493$), so the verifier's bound check passes. Substituting the definitions:
 \[
 z \cdot h_4 + z_{\text{BLS}} \cdot h_0 = (u_m + c m) h_4 + (u_{\text{BLS}} + c r_{\text{BLS}}) h_0 = R_{\text{BLS}} + c \cdot C_{\text{BLS}},
 \]
@@ -714,18 +720,18 @@ Set $m = \frac{\Delta z}{\Delta c}$ (computed over integers) and $r_{\text{BLS}}
 \end{proof}
 
 \begin{theorem}[Zero-Knowledge]
-Under the random oracle model, the non-interactive BEQ protocol is statistically zero-knowledge with distinguishing advantage bounded by $2^{-80}$.
+Under the random oracle model, the non-interactive BEQ protocol with rejection sampling is statistically zero-knowledge with distinguishing advantage bounded by $2^{-80}$. Moreover, the support of $z$ in real executions is exactly $[0, 2^{240}-1]$---the same as the simulator---so no transcript component is outside the simulator's range.
 \end{theorem}
 \begin{proof}
 We construct a simulator $\mathcal{S}$ that, on input $(C_{\text{BLS}}, \text{ctx})$ and without knowledge of the witness, produces a transcript $\pi_{\text{BEQ}} = (C_{25519}, R_{\text{BLS}}, R_{25519}, z, z_{\text{BLS}}, z_{25519}, \pi_{\text{range}})$ as follows:
 \begin{enumerate}
 \item Choose a random challenge $c \xleftarrow{\$} \{0,1\}^{128}$.
-\item Choose random $z \xleftarrow{\$} [0, 2^{241}-1]$, $z_{\text{BLS}} \xleftarrow{\$} \mathbb{Z}_{q_{\text{BLS}}}$, $z_{25519} \xleftarrow{\$} \mathbb{Z}_{q_{25519}}$.
+\item Choose random $z \xleftarrow{\$} [0, 2^{240}-1]$, $z_{\text{BLS}} \xleftarrow{\$} \mathbb{Z}_{q_{\text{BLS}}}$, $z_{25519} \xleftarrow{\$} \mathbb{Z}_{q_{25519}}$.
 \item Compute $R_{\text{BLS}} = z \cdot h_4 + z_{\text{BLS}} \cdot h_0 - c \cdot C_{\text{BLS}}$ and $R_{25519} = z \cdot G + z_{25519} \cdot H - c \cdot C_{25519}$, where $C_{25519}$ is an arbitrary commitment to $0$.
 \item Generate a simulated Bulletproof $\pi_{\text{range}}$ for $C_{25519}$ with range $[0,2^{32}-1]$ using the honest-verifier zero-knowledge property of Dalek Bulletproofs (by programming the internal random oracle).
 \item Program $\mathcal{H}_{128}$ to return $c$ on the appropriate input.
 \end{enumerate}
-In a real execution, $z = u_m + c \cdot m$ where $u_m \in [0,2^{240}-1]$ and $c \cdot m < 2^{160}$. Thus $z$ is uniformly distributed over an interval of length $2^{240}$ shifted by at most $2^{160}$. The simulated $z$ is uniform over $[0, 2^{241}-1]$. The statistical distance between these two distributions is bounded by $\frac{2^{160}}{2^{240}} = 2^{-80}$, which is negligible. The other components are identically distributed. Hence, the simulation is statistically indistinguishable.
+In a real execution with rejection sampling, the prover discards any $u_m$ for which $z = u_m + c \cdot m > 2^{240}-1$. For any fixed challenge $c$ and message $m$, the map $u_m \mapsto z = u_m + c \cdot m$ is a bijection on integers, so conditioning on $z \le 2^{240}-1$ is equivalent to conditioning on $u_m \le 2^{240}-1 - c \cdot m$. Since $u_m$ is uniform over $[0, 2^{240}-1]$ and the accepted values fill a contiguous sub-interval of length $2^{240} - c \cdot m$, the accepted $z$ is uniform over $[0, 2^{240}-1 - c \cdot m] \subseteq [0, 2^{240}-1]$. The simulated $z$ is uniform over the full $[0, 2^{240}-1]$. The statistical distance between these distributions is $c \cdot m / 2^{240} \le (2^{128}-1)(2^{32}-1)/2^{240} < 2^{-80}$, which is negligible---but more importantly, both distributions are supported on $[0, 2^{240}-1]$, so no single value of $z$ is impossible in simulation yet possible in real execution or vice versa. The other components are identically distributed. Hence, the simulation achieves negligible statistical distance, and the distinguishing advantage is at most $2^{-80}$.
 \end{proof}
 
 \subsubsection{Transcript Binding}
@@ -906,7 +912,7 @@ For spend requests, the cache key uses the same length-prefixed encoding:
 \[
 h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}\!\left(\text{``EBUT:Idempotency:Spend''} \parallel \mathsf{len}(\pi_{\mathsf{spend}}) \parallel \pi_{\mathsf{spend}} \parallel \eta \right).
 \]
-The fixed length of $\eta$ (16 bytes) eliminates ambiguity on that side; the length prefix on $\pi_{\mathsf{spend}}$ prevents byte-shifting between the proof and the nonce field. Raw concatenation $\pi_{\mathsf{spend}} \parallel \eta$ without a length delimiter is \textbf{prohibited} because a byte shifted from the end of $\pi_{\mathsf{spend}}$ into $\eta$ yields an identical octet string, mapping two distinct requests to the same cache key. The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for a short duration (e.g., 60 seconds). \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database.} If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends.
+The fixed length of $\eta$ (16 bytes) eliminates ambiguity on that side; the length prefix on $\pi_{\mathsf{spend}}$ prevents byte-shifting between the proof and the nonce field. Raw concatenation $\pi_{\mathsf{spend}} \parallel \eta$ without a length delimiter is \textbf{prohibited} because a byte shifted from the end of $\pi_{\mathsf{spend}}$ into $\eta$ yields an identical octet string, mapping two distinct requests to the same cache key. The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for the duration of the epoch plus the grace period---the same TTL assigned to the corresponding $k_{\mathsf{cur}}$ entry in $\DB_{\mathsf{spend}}$. \textbf{This TTL must exactly match or exceed the TTL of the token nullifier.} If the idempotency cache entry expires before $k_{\mathsf{cur}}$ expires in $\DB_{\mathsf{spend}}$, a client whose network dropped after the server committed the transaction but before the client received the response will later retry, find no cache hit, reach the double-spend check, and be permanently rejected with a 409 Conflict---losing their token with no recourse. \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database.} If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends.
 
 \subsection{API Payload Specification}
 
@@ -992,6 +998,7 @@ The server maintains two logical sets:
 \begin{itemize}
 \item $\DB_{\mathsf{epoch}}$: stores compressed $\mathbb{G}_1$ points (48 bytes). Entries are assigned a TTL of \emph{epoch duration $+$ grace period} at insertion time. \textbf{The database must not be bulk-cleared at the epoch boundary}; individual entries expire after their TTL elapses.
 \item $\DB_{\mathsf{spend}}$: stores canonical scalars (32 bytes). Entries are assigned a TTL of \emph{epoch duration $+$ grace period} at insertion time. \textbf{The database must not be bulk-cleared at the epoch boundary}; individual entries expire after their TTL elapses.
+\item \textbf{Nonce store} ($\mathcal{N}_{\mathsf{spent}}$): stores the 16-byte session nonces $\eta$ that have been consumed during spend operations. Each entry \textbf{must} be assigned a TTL equal to \emph{epoch duration $+$ grace period}---the same TTL as $\DB_{\mathsf{spend}}$. Omitting a TTL causes permanent accumulation: at high spend velocity, uncontrolled growth of the nonce set will exhaust Redis memory. In Redis, store each nonce as \texttt{SET "nonce:\{eta\_hex\}" 1 EXAT \{epoch\_end + grace\_seconds\}} to guarantee per-entry expiry independent of other entries.
 \end{itemize}
 
 \paragraph{Epoch Grace Period.}
@@ -1043,6 +1050,9 @@ The unlinkability of $N_T$ across epochs relies on the SXDH assumption in Type-3
 
 \paragraph{Token Theft Resistance.}
 Even if an attacker intercepts a \texttt{SpendRequest} and submits it before the victim, the attacker receives only the blind signature $(A^*, e^*, s'^*)$. Without the local blinding factor $r^*$, the attacker cannot compute the final token secret $s^* = r^* + s'^*$. The token is cryptographically useless to the attacker, while the victim can safely resubmit (or receive from the idempotency cache) and unblind correctly.
+
+\paragraph{Plaintext Spend Amount and Statistical Fingerprinting.}
+The spend amount $s$ is transmitted in plaintext (Section~4.4.3, Step~1). While the token nullifiers $k_{\mathsf{cur}}$ are perfectly randomized and unlinkable across spend requests, the metadata value $s$ creates a potential behavioral side-channel. A server that logs spend requests may perform statistical fingerprinting on the sequence of $s$ values to link intra-epoch transactions originating from the same user. For most deployments this is an acceptable trade-off, as the server is already trusted not to attempt de-anonymization via timing or traffic analysis. If strict intra-epoch unlinkability of spend amounts is required (e.g., in high-assurance deployments), the amount $s$ must be committed and hidden, with the server verifying $\sum s_i \le c_{\mathsf{max}}$ over the epoch using a homomorphic accumulator rather than plaintext step-downs. This extension is left for future work.
 
 \section{Performance Evaluation}
 
