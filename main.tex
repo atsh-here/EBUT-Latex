@@ -412,8 +412,9 @@ The client proves knowledge of a valid master token and correct derivation of $N
 \subsubsection{Server Verification}
 The server performs the following checks in order:
 \begin{enumerate}[leftmargin=*]
+\item \textbf{Idempotency cache check (FIRST):} Compute $\mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}(\text{``EBUT:Idempotency:Refresh''} \parallel \mathsf{len}(\pi_{\mathsf{refresh}}) \parallel \pi_{\mathsf{refresh}})$. If $\mathtt{key}_{\mathsf{ref}}$ is present in the idempotency cache, return the cached $(A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ immediately \textbf{without} re-executing the expensive verification or touching $\DB_{\mathsf{epoch}}$.
 \item \textbf{Epoch check:} $T$ must equal the current epoch (or be within a small grace window).
-\item \textbf{Nullifier freshness check (read-only):} $N_T \notin \DB_{\mathsf{epoch}}$ and $N_T \neq 1_{\mathbb{G}_1}$. \textbf{Do not insert $N_T$ at this step.} Inserting before the proofs are verified creates a TOCTOU vulnerability: an adversary can submit a valid $N_T$ with garbage ZK proofs, causing the server to burn the legitimate user's epoch nullifier in step~2 and then abort during proof verification, permanently locking the user out for the entire epoch.
+\item \textbf{Nullifier freshness check (read-only):} $N_T \notin \DB_{\mathsf{epoch}}$ and $N_T \neq 1_{\mathbb{G}_1}$. \textbf{Do not insert $N_T$ at this step.} Inserting before all proofs are verified creates a TOCTOU vulnerability: an adversary can submit a valid $N_T$ with garbage ZK proofs; the server would prematurely burn the epoch nullifier and then abort during proof verification, permanently locking the legitimate user out for the entire epoch. All state mutations are deferred to the atomic step~11.
 \item \textbf{Basic bounds:} $A' \neq 1_{\mathbb{G}_1}$ and $T_{\mathsf{BBS}} \neq 1_{\mathbb{G}_1}$.
 \item \textbf{Expiry bridge:} $C_{\mathsf{bridge}} \stackrel{?}{=} C_{\Delta} + T \cdot h_3$.
 \item \textbf{Recompute challenge $c$} from the received values (including $H_{\mathsf{ctx}}$ and $\mathsf{pk}_S$).
@@ -432,14 +433,14 @@ The server performs the following checks in order:
   \[
   e(A', \mathsf{pk}_S) \stackrel{?}{=} e(\bar{A}, g_2).
   \]
-\item \textbf{Atomic state mutation (step 10, LAST):} Only after all checks in steps~1--9 pass: atomically insert $N_T$ into $\DB_{\mathsf{epoch}}$ (reject if already present, indicating a concurrent duplicate or replay). This deferred write ensures that a request with a valid $N_T$ but invalid proofs cannot permanently burn the epoch nullifier of a legitimate user.
+\item \textbf{Atomic state mutation (step 11, LAST):} Only after all checks in steps~1--10 pass: first write $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ to the idempotency cache, then atomically insert $N_T$ into $\DB_{\mathsf{epoch}}$ (reject if already present, indicating a concurrent duplicate or replay). \textbf{The idempotency cache entry must be persisted before the $\DB_{\mathsf{epoch}}$ insertion.} If the server crashes between these two writes and the client retries with the same $\pi_{\mathsf{refresh}}$, the retry will hit the idempotency cache and receive the correct response without touching $\DB_{\mathsf{epoch}}$. If both writes are to separate storage systems, they must be wrapped in a single distributed transaction or the cache must be written first; writing to $\DB_{\mathsf{epoch}}$ first voids the idempotency guarantee and will permanently lock out a client whose network dropped between the two writes.
 \end{enumerate}
 
 If all checks pass, the server issues a daily token by choosing $e_{\mathsf{daily}}, s'_{\mathsf{daily}} \xleftarrow{\$} \mathbb{Z}_q$ and computing
 \[
 A_{\mathsf{daily}} = \left( g_1 \cdot K_{\mathsf{daily}} \cdot h_0^{s'_{\mathsf{daily}}} \right)^{\frac{1}{e_{\mathsf{daily}} + y}}.
 \]
-It caches the response for idempotency and sends $(A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ to the client.
+It sends $(A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ to the client (the response was already cached in the idempotency store during the atomic mutation step above).
 
 \subsubsection{Client Finalisation}
 The client sets $s_{\mathsf{daily}} = r_{\mathsf{daily}} + s'_{\mathsf{daily}} \bmod q$. The daily token is
@@ -490,16 +491,16 @@ The client proves knowledge of a valid daily token on $(c_{\mathsf{bal}}, k_{\ma
   Compute bridging commitments:
   \begin{align*}
     T_{\mathsf{scale},T} &= \rho_{r_1} \cdot C_{\mathsf{total}}, & T_{\mathsf{total}} &= \rho_{\tilde{c}} \cdot h_4 + \rho_u \cdot h_1 + \rho_{r_1} \cdot T \cdot h_2 + \rho_v \cdot h_0, \\
-    T_{\mathsf{scale},R} &= \rho_{r_1} \cdot K', & T_{\mathsf{refund}} &= \rho_m \cdot h_4 + \rho_u \cdot h_1 + \rho_{r_1} \cdot T \cdot h_2 + \rho_v \cdot h_0, \\
     T_{\mathsf{scale},BP} &= \rho_{r_1} \cdot C_{\mathsf{BP}}, & T_{\mathsf{BP}} &= \rho_m \cdot h_4 + \rho_w \cdot h_0.
   \end{align*}
+  The refund bridging pair $(T_{\mathsf{scale},R}, T_{\mathsf{refund}})$ is omitted: it is a linear combination of $T_{\mathsf{total}}$ and the public spend-bridge equation $C_{\mathsf{total}} = K' + s \cdot h_4$ and therefore provides no additional soundness (see Section~\ref{sec:crosscurve}).
 \item \textbf{Challenge.}
   The challenge includes a session nonce $\eta$ for replay prevention:
   \[
   c = \mathcal{H}_{\mathsf{scalar}}\left(
   \begin{array}{c}
   H_{\mathsf{ctx}} \parallel \mathsf{pk}_S \parallel s \parallel k_{\mathsf{cur}} \parallel T \parallel \eta \parallel K' \parallel C_{\mathsf{total}} \parallel C_{\mathsf{BP}} \parallel \pi_{\text{BEQ\_spend}} \parallel \\
-  A' \parallel \bar{A} \parallel T_{\mathsf{BBS}} \parallel T_{\mathsf{scale},T} \parallel T_{\mathsf{total}} \parallel T_{\mathsf{scale},R} \parallel T_{\mathsf{refund}} \parallel T_{\mathsf{scale},BP} \parallel T_{\mathsf{BP}} \parallel \text{``Spend''}
+  A' \parallel \bar{A} \parallel T_{\mathsf{BBS}} \parallel T_{\mathsf{scale},T} \parallel T_{\mathsf{total}} \parallel T_{\mathsf{scale},BP} \parallel T_{\mathsf{BP}} \parallel \text{``Spend''}
   \end{array}
   \right).
   \]
@@ -517,7 +518,6 @@ The client proves knowledge of a valid daily token on $(c_{\mathsf{bal}}, k_{\ma
   \begin{itemize}[leftmargin=*, nosep]
   \item The randomized BBS+ components $A', \bar{A}, T_{\mathsf{BBS}}$.
   \item The spend bridging commitments $T_{\mathsf{scale},T}, T_{\mathsf{total}}$.
-  \item The refund bridging commitments $T_{\mathsf{scale},R}, T_{\mathsf{refund}}$.
   \item The range proof bridging commitments $T_{\mathsf{scale},BP}, T_{\mathsf{BP}}$.
   \item The scalar responses $z_e, z_{r_1}, z_{\tilde{s}}, z_{\tilde{c}}, z_u, z_v, z_w$.
   \item The derived response $z_m = z_{\tilde{c}} - s \cdot z_{r_1}$ (computed by verifier).
@@ -539,23 +539,23 @@ The client proves knowledge of a valid daily token on $(c_{\mathsf{bal}}, k_{\ma
 \item \textbf{Verify bridging equalities:}
   \begin{align*}
     z_{\tilde{c}} \cdot h_4 + z_u \cdot h_1 + z_{r_1} \cdot T \cdot h_2 + z_v \cdot h_0 - T_{\mathsf{total}} &\stackrel{?}{=} z_{r_1} \cdot C_{\mathsf{total}} - T_{\mathsf{scale},T}, \\
-    z_m \cdot h_4 + z_u \cdot h_1 + z_{r_1} \cdot T \cdot h_2 + z_v \cdot h_0 - T_{\mathsf{refund}} &\stackrel{?}{=} z_{r_1} \cdot K' - T_{\mathsf{scale},R}, \\
     z_m \cdot h_4 + z_w \cdot h_0 - T_{\mathsf{BP}} &\stackrel{?}{=} z_{r_1} \cdot C_{\mathsf{BP}} - T_{\mathsf{scale},BP}.
   \end{align*}
+  The refund equation ($z_m \cdot h_4 + z_u \cdot h_1 + \cdots \stackrel{?}{=} z_{r_1} \cdot K' - T_{\mathsf{scale},R}$) is not checked separately: it is an exact linear combination of the first equation above and the public spend-bridge $C_{\mathsf{total}} = K' + s \cdot h_4$ (verified in step~6), so it carries no additional soundness.
 \item \textbf{Schnorr MSM:}
   \[
   A'^{-z_e} \cdot g_1^{z_{r_1}} \cdot h_0^{z_{\tilde{s}}} \cdot h_4^{z_{\tilde{c}}} \cdot h_1^{k_{\mathsf{cur}} \cdot z_{r_1}} \cdot h_2^{T \cdot z_{r_1}} \stackrel{?}{=} T_{\mathsf{BBS}} \cdot \bar{A}^c.
   \]
 \item \textbf{BEQ verification:} Verify $\pi_{\text{BEQ\_spend}}$ w.r.t. $C_{\mathsf{BP}}$.
 \item \textbf{Pairing check:} $e(A', \mathsf{pk}_S) = e(\bar{A}, g_2)$.
-\item \textbf{Atomic state mutation (step 14, LAST):} Only after all checks in steps 1--13 pass: atomically insert $k_{\mathsf{cur}}$ into $\DB_{\mathsf{spend}}$ (reject if already present, indicating a concurrent double-spend race); atomically mark $\eta$ as spent in the nonce store. These writes must be performed as a single atomic transaction or with optimistic concurrency control to prevent TOCTOU races.
+\item \textbf{Atomic state mutation (step 14, LAST):} Only after all checks in steps 1--13 pass: first write $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ to the idempotency cache (computing $(A^*, e^*, s'^*)$ by signing $K'$ as described below), then atomically insert $k_{\mathsf{cur}}$ into $\DB_{\mathsf{spend}}$ (reject if already present, indicating a concurrent double-spend race) and atomically mark $\eta$ as spent in the nonce store. \textbf{The idempotency cache entry must be written before the $\DB_{\mathsf{spend}}$ insertion.} If both writes are to separate storage systems, wrap them in a single distributed transaction or write the cache first; reversing the order voids the idempotency guarantee (a client that retried after a crash would find no cache hit, hit the double-spend check, and be permanently rejected with a 409 Conflict).
 \end{enumerate}
 
 If all checks pass and state mutations succeed, the server issues a refund token by choosing $e^*, s'^* \xleftarrow{\$} \mathbb{Z}_q$ and computing
 \[
 A^* = \left( g_1 \cdot K' \cdot h_0^{s'^*} \right)^{\frac{1}{e^* + y}}.
 \]
-It caches the response for idempotency and sends $(A^*, e^*, s'^*)$ to the client.
+It sends $(A^*, e^*, s'^*)$ to the client (the response was already cached in the idempotency store during the atomic mutation step above).
 
 \subsubsection{Client Finalisation}
 The client sets $s^* = r^* + s'^* \bmod q$ and obtains the new token
@@ -619,6 +619,9 @@ and that $m \in [0, 2^{32}-1]$.
 \textbf{Input:} $m \in [0, 2^{32}-1]$, $r_{\text{BLS}} \in \mathbb{Z}_{q_{\text{BLS}}}$, $r_{25519} \in \mathbb{Z}_{q_{25519}}$, context string $\text{ctx}$, and optional auxiliary commitments $\text{comm}_1,\dots,\text{comm}_k \in \mathbb{G}_{\text{BLS}}$ (e.g., BBS+ proof components).
 
 \begin{enumerate}[leftmargin=*]
+\item \textbf{Range Proof:}
+  Generate a Dalek Bulletproof $\pi_{\text{range}}$ for the Ristretto commitment $C_{25519}$ proving that $m \in [0, 2^{32}-1]$. Because $\pi_{\text{range}}$ depends only on the statement $C_{25519}$ and not on the Sigma-protocol blinders chosen in step~2, it \textbf{must} be generated before the rejection-sampling loop: the Fiat--Shamir challenge $c$ in step~3 binds $\pi_{\text{range}}$, so $\pi_{\text{range}}$ must be fixed before any blinder is committed to. The Bulletproof transcript is initialized with domain separator \texttt{"EBUT:BEQ:Range"} and includes $\mathsf{len}(\text{ctx}) \parallel \text{ctx}$ followed by $\mathsf{len}(\text{comm}_i) \parallel \text{comm}_i$ for each auxiliary commitment, using the same length-prefixed encoding mandated for the Fiat--Shamir challenge below.
+
 \item \textbf{Commitments (with rejection sampling):}
   Repeat the following until acceptance:
   \begin{enumerate}
@@ -640,9 +643,6 @@ and that $m \in [0, 2^{32}-1]$.
   \end{enumerate}
   The expected number of iterations is less than~2; rejection occurs with probability at most $(2^{32}-1) \cdot (2^{128}-1) / 2^{240} < 2^{-80}$, where $c_{\max} \le 2^{32}-1$ per Section~4.1 and $c < 2^{128}$.
 
-\item \textbf{Range Proof:}
-  Generate a Dalek Bulletproof $\pi_{\text{range}}$ for the Ristretto commitment $C_{25519}$ proving that $m \in [0, 2^{32}-1]$. The Bulletproof transcript is initialized with domain separator \texttt{"EBUT:BEQ:Range"} and includes $\mathsf{len}(\text{ctx}) \parallel \text{ctx}$ followed by $\mathsf{len}(\text{comm}_i) \parallel \text{comm}_i$ for each auxiliary commitment, using the same length-prefixed encoding mandated for the Fiat--Shamir challenge below.
-
 \item \textbf{Challenge:}
   Compute the 128-bit challenge using length-prefixed encoding for all variable-length fields to prevent byte-shifting transcript collisions (the same requirement mandated for the idempotency cache in Section~7.4):
   \[
@@ -650,6 +650,7 @@ and that $m \in [0, 2^{32}-1]$.
   \begin{array}{l}
   \text{``EBUT:BEQ:Challenge''} \parallel
   \mathsf{len}(\text{ctx}) \parallel \text{ctx} \parallel
+  h_4 \parallel h_0 \parallel G \parallel H \parallel
   C_{\text{BLS}} \parallel C_{25519} \parallel
   R_{\text{BLS}} \parallel R_{25519} \parallel
   \mathsf{len}(\pi_{\text{range}}) \parallel \pi_{\text{range}} \parallel \\
@@ -658,10 +659,10 @@ and that $m \in [0, 2^{32}-1]$.
   \end{array}
   \right),
   \]
-  where $\mathsf{len}(\cdot)$ denotes a fixed-width 4-byte big-endian encoding of the byte length of the following field. The curve group elements $C_{\text{BLS}}$, $C_{25519}$, $R_{\text{BLS}}$, $R_{25519}$ are always fixed size (48, 32, 48, and 32 bytes respectively) and do not require length prefixes; however, $\text{ctx}$, $\pi_{\text{range}}$, and each $\text{comm}_i$ are variable-length and \textbf{must} be length-prefixed. Raw concatenation of variable-length fields without delimiters is \textbf{prohibited}: an attacker can shift bytes between adjacent variable-length fields to produce an identical transcript hash for two distinct proof statements, breaking binding.
+  where $\mathsf{len}(\cdot)$ denotes a fixed-width 4-byte big-endian encoding of the byte length of the following field. The public generators $h_4, h_0 \in \mathbb{G}_{\text{BLS}}$ (48 bytes each) and $G, H \in \mathbb{G}_{25519}$ (32 bytes each) are fixed size and \textbf{must} be bound into the transcript to prevent parameter-substitution attacks; they do not require length prefixes. The remaining curve group elements $C_{\text{BLS}}$, $C_{25519}$, $R_{\text{BLS}}$, $R_{25519}$ are always fixed size (48, 32, 48, and 32 bytes respectively) and do not require length prefixes; however, $\text{ctx}$, $\pi_{\text{range}}$, and each $\text{comm}_i$ are variable-length and \textbf{must} be length-prefixed. Raw concatenation of variable-length fields without delimiters is \textbf{prohibited}: an attacker can shift bytes between adjacent variable-length fields to produce an identical transcript hash for two distinct proof statements, breaking binding.
 
 \item \textbf{Responses:}
-  Use the $z = u_m + c \cdot m$ accepted in step~1 (over the integers, not reduced modulo any group order).
+  Use the $z = u_m + c \cdot m$ accepted in step~2 (over the integers, not reduced modulo any group order).
   Compute modular responses:
   \[
   z_{\text{BLS}} = u_{\text{BLS}} + c \cdot r_{\text{BLS}} \pmod{q_{\text{BLS}}}, \qquad
@@ -688,6 +689,7 @@ and that $m \in [0, 2^{32}-1]$.
   \begin{array}{l}
   \text{``EBUT:BEQ:Challenge''} \parallel
   \mathsf{len}(\text{ctx}) \parallel \text{ctx} \parallel
+  h_4 \parallel h_0 \parallel G \parallel H \parallel
   C_{\text{BLS}} \parallel C_{25519} \parallel
   R_{\text{BLS}} \parallel R_{25519} \parallel
   \mathsf{len}(\pi_{\text{range}}) \parallel \pi_{\text{range}} \parallel \\
@@ -935,6 +937,9 @@ When the server issues a Daily Token, it computes a cache key using a length-pre
 where $\mathsf{len}(\cdot)$ denotes a fixed-width (e.g., 4-byte big-endian) encoding of the byte length of the following field. This length-prefix prevents an adversary from shifting bytes between fields to produce the same concatenated input for different payloads.
 The mapping $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ is stored for the remainder of the epoch (or at least several minutes). If a client resubmits an identical $\pi_{\mathsf{refresh}}$, the server returns the cached response \textbf{without} re-executing the expensive verification (pairings, MSMs) and \textbf{without} re-checking the epoch nullifier in $\DB_{\mathsf{epoch}}$.
 
+\textbf{Write ordering requirement.}
+The idempotency cache entry \textbf{must} be written \emph{before} inserting $N_T$ into $\DB_{\mathsf{epoch}}$ (see Section~4.3.3, step~11). If the server crashes between the $\DB_{\mathsf{epoch}}$ insertion and the cache write, the client's retry will find $N_T$ already in $\DB_{\mathsf{epoch}}$ but no cache hit, and the server will permanently reject the user for the entire epoch. Writing the cache first eliminates this window: if the server crashes between the cache write and the $\DB_{\mathsf{epoch}}$ insertion, the retry finds a cache hit and returns the correct response without touching $\DB_{\mathsf{epoch}}$. If the idempotency cache and $\DB_{\mathsf{epoch}}$ reside in separate storage systems, these two writes must be wrapped in a single distributed transaction, or the cache must be written first.
+
 \textbf{Limitation: idempotency cache cannot recover from client-side state loss.}
 The server's idempotency cache protects against \emph{network-layer} retries where the client retransmits the same proof. It does \emph{not} protect against the case where the client crashes and loses volatile state (RAM) between generating the commitment and receiving the server response. In that scenario the rebooted client lacks $r_{\mathsf{daily}}$ and $k_{\mathsf{daily}}$ and must generate a \emph{new} $K_{\mathsf{daily}}$ and a new $\pi_{\mathsf{refresh}}$. The new proof hashes to a different $\mathtt{key}_{\mathsf{ref}}$, so the server bypasses the cache, hits $\DB_{\mathsf{epoch}}$, finds $N_T$ already burned, and rejects the request---permanently locking the user out for the epoch. Even if the server keyed the cache by $N_T$ and returned the old blind signature, the client cannot use it without $r_{\mathsf{daily}}$. \textbf{The only robust defence is the client-side persistence requirement stated in Section~4.3.1}: the client must durably persist $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ before initiating the network request.
 
@@ -943,7 +948,7 @@ For spend requests, the cache key uses the same length-prefixed encoding:
 \[
 h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}\!\left(\text{``EBUT:Idempotency:Spend''} \parallel \mathsf{len}(\pi_{\mathsf{spend}}) \parallel \pi_{\mathsf{spend}} \parallel \eta \right).
 \]
-The fixed length of $\eta$ (16 bytes) eliminates ambiguity on that side; the length prefix on $\pi_{\mathsf{spend}}$ prevents byte-shifting between the proof and the nonce field. Raw concatenation $\pi_{\mathsf{spend}} \parallel \eta$ without a length delimiter is \textbf{prohibited} because a byte shifted from the end of $\pi_{\mathsf{spend}}$ into $\eta$ yields an identical octet string, mapping two distinct requests to the same cache key. The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for the duration of the epoch plus the grace period---the same TTL assigned to the corresponding $k_{\mathsf{cur}}$ entry in $\DB_{\mathsf{spend}}$. \textbf{This TTL must exactly match or exceed the TTL of the token nullifier.} If the idempotency cache entry expires before $k_{\mathsf{cur}}$ expires in $\DB_{\mathsf{spend}}$, a client whose network dropped after the server committed the transaction but before the client received the response will later retry, find no cache hit, reach the double-spend check, and be permanently rejected with a 409 Conflict---losing their token with no recourse. \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database.} If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends.
+The fixed length of $\eta$ (16 bytes) eliminates ambiguity on that side; the length prefix on $\pi_{\mathsf{spend}}$ prevents byte-shifting between the proof and the nonce field. Raw concatenation $\pi_{\mathsf{spend}} \parallel \eta$ without a length delimiter is \textbf{prohibited} because a byte shifted from the end of $\pi_{\mathsf{spend}}$ into $\eta$ yields an identical octet string, mapping two distinct requests to the same cache key. The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for the duration of the epoch plus the grace period---the same TTL assigned to the corresponding $k_{\mathsf{cur}}$ entry in $\DB_{\mathsf{spend}}$. \textbf{This TTL must exactly match or exceed the TTL of the token nullifier.} If the idempotency cache entry expires before $k_{\mathsf{cur}}$ expires in $\DB_{\mathsf{spend}}$, a client whose network dropped after the server committed the transaction but before the client received the response will later retry, find no cache hit, reach the double-spend check, and be permanently rejected with a 409 Conflict---losing their token with no recourse. \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database}, and must be \emph{written before} $\DB_{\mathsf{spend}}$ is mutated (see Section~4.4.3, step~14). If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends. If the cache and the double-spend database reside in separate storage systems, these two writes must be wrapped in a single distributed transaction, or the cache must be written first.
 
 \subsection{API Payload Specification}
 
@@ -996,8 +1001,6 @@ Implementers must transmit the public statements alongside the proof. We provide
     "T_BBS": <48-byte compressed G1 point, hex>,
     "T_scale_T": <48-byte compressed G1 point, hex>,
     "T_total": <48-byte compressed G1 point, hex>,
-    "T_scale_R": <48-byte compressed G1 point, hex>,
-    "T_refund": <48-byte compressed G1 point, hex>,
     "T_scale_BP": <48-byte compressed G1 point, hex>,
     "T_BP": <48-byte compressed G1 point, hex>,
     "z_e": <32-byte scalar, hex>,
@@ -1055,7 +1058,7 @@ To prevent CPU exhaustion attacks from malformed proofs, the server must perform
 \item \textbf{Schnorr MSM verification} (BBS+ core without pairing) – $\approx 0.5$ ms.
 \item \textbf{Bulletproof verification} (or BEQ verification) – $\approx 1$--$2$ ms.
 \item \textbf{Bilinear pairing checks} – $\approx 2$--$4$ ms.
-\item \textbf{Atomic state mutation} (insert nullifier into $\DB_{\mathsf{spend}}$, mark nonce as spent; reject on concurrent duplicate).
+\item \textbf{Atomic state mutation} (write idempotency cache first; then insert nullifier into $\DB_{\mathsf{spend}}$, mark nonce as spent; reject on concurrent duplicate).
 \end{enumerate}
 
 \subsection{Edge Cases}
@@ -1076,8 +1079,16 @@ The standard nonce acquisition method (\texttt{GET /nonce}) creates a temporal c
 Two sound alternatives exist:
 
 \begin{enumerate}[leftmargin=*]
-  \item \textbf{ZK-membership with leaf nullifier (recommended for high-privacy deployments).}
-    The server publishes a Merkle root $\mathsf{rt}$ of a set of nonces. The client selects a leaf $\eta_i$ and its inclusion path \emph{offline} (e.g., from a previously cached full tree or via an anonymous channel). When spending, instead of revealing $\eta_i$ and its path, the client proves in zero-knowledge that $\eta_i$ is a member of the tree under $\mathsf{rt}$, and derives a deterministic leaf nullifier $N_\eta = \mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:LeafNullifier:''} \parallel \eta_i)$ which is submitted in place of $\eta$. The server checks $N_\eta \notin \mathcal{N}_{\mathsf{spent}}$ and verifies the ZK membership proof against $\mathsf{rt}$, then marks $N_\eta$ as spent. This completely decouples the identity of the leaf from the spend submission. The membership proof can be constructed using a standard Merkle-Schnorr ZK argument or a succinct proof system (e.g., a Merkle proof inside a Bulletproof/STARK circuit).
+  \item \textbf{ZK-membership with token-bound leaf nullifier (recommended for high-privacy deployments).}
+    The server publishes a Merkle root $\mathsf{rt}$ of a set of nonces. The client selects a leaf $\eta_i$ and its inclusion path \emph{offline} (e.g., from a previously cached full tree or via an anonymous channel). When spending, instead of revealing $\eta_i$ and its path, the client derives a leaf nullifier that \textbf{binds the nonce to the client's token secret} $k_{\mathsf{cur}}$ (unknown to the server):
+    \[
+    N_\eta = \mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:LeafNullifier:''} \parallel k_{\mathsf{cur}} \parallel \eta_i).
+    \]
+    \textbf{Critical security requirement---client secret in nullifier.}
+    The nullifier \textbf{must} incorporate $k_{\mathsf{cur}}$ (or another client-side secret not known to the server). A purely server-derived nullifier $\mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:LeafNullifier:''} \parallel \eta_i)$ is \textbf{catastrophically insecure}: because the server generated the Merkle tree it knows every $\eta_i$, and can pre-compute a rainbow table $\eta_i \mapsto N_\eta$ for the entire set. When the client submits $N_\eta$, the server looks up the exact leaf that was consumed and recovers the IP address that downloaded that specific Merkle branch, perfectly defeating the anonymity goal.
+
+    Binding $k_{\mathsf{cur}}$ into the nullifier prevents this attack because the server does not know $k_{\mathsf{cur}}$ and cannot pre-image the hash. The ZK proof submitted by the client must establish three things in zero-knowledge: (1) $\eta_i$ is a member of the Merkle tree under $\mathsf{rt}$; (2) $k_{\mathsf{cur}}$ is the secret committed in the current token; and (3) $N_\eta$ was correctly derived as $\mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:LeafNullifier:''} \parallel k_{\mathsf{cur}} \parallel \eta_i)$. The server checks $N_\eta \notin \mathcal{N}_{\mathsf{spent}}$, verifies the ZK proof against $\mathsf{rt}$ and the token commitment, then marks $N_\eta$ as spent. The membership proof can be constructed using a succinct proof system (e.g., a STARK or a Bulletproof-based circuit) that supports hashing and arithmetic.
+
   \item \textbf{Anonymous-network nonce retrieval (simplest deployment).}
     The client fetches the nonce via Tor, a mixnet, or another anonymous transport before initiating the spend. The standard \texttt{GET /nonce} flow is used, but the network-layer identity is unlinkable from the spend submission. No changes to the cryptographic protocol are required.
 \end{enumerate}
