@@ -186,8 +186,8 @@ An EBUT scheme consists of the following polynomial-time algorithms and interact
 
 The server maintains two databases for double-spending prevention:
 \begin{itemize}
-\item $\DB_{\mathsf{epoch}}$: stores epoch nullifiers $N_T \in \mathbb{G}_1$ observed during $\mathsf{Refresh}$; cleared at the start of each epoch.
-\item $\DB_{\mathsf{spend}}$: stores token nullifiers $k_{\mathsf{cur}} \in \mathbb{Z}_q^*$ observed during $\mathsf{Spend}$; cleared at the start of each epoch.
+\item $\DB_{\mathsf{epoch}}$: stores epoch nullifiers $N_T \in \mathbb{G}_1$ observed during $\mathsf{Refresh}$; entries carry a TTL equal to the epoch duration plus the grace period, and are expired individually rather than bulk-cleared at the epoch boundary.
+\item $\DB_{\mathsf{spend}}$: stores token nullifiers $k_{\mathsf{cur}} \in \mathbb{Z}_q^*$ observed during $\mathsf{Spend}$; entries carry a TTL equal to the epoch duration plus the grace period, and are expired individually rather than bulk-cleared at the epoch boundary.
 \end{itemize}
 Additionally, the server may employ an idempotency cache to handle retries gracefully.
 
@@ -291,7 +291,7 @@ The global parameters $\mathsf{pp}$ consist of:
   \[
   H_{\mathsf{ctx}} = \mathcal{H}_{\mathsf{scalar}}(\text{``EBUT:Context''} \parallel \text{AppID} \parallel \mathsf{pk}_S),
   \]
-  where $\mathcal{H}_{\mathsf{scalar}}: \{0,1\}^* \to \mathbb{Z}_q$ is a hash function modeled as a random oracle.
+  where $\mathcal{H}_{\mathsf{scalar}}: \{0,1\}^* \to \mathbb{Z}_q$ is a hash function modeled as a random oracle. \textbf{Implementation requirement:} Because $q$ (the BLS12-381 scalar field order) is a 255-bit prime, a direct reduction of a 256-bit hash output modulo $q$ introduces statistical bias — values in $[0,\, 2^{256} \bmod q)$ are sampled with probability ${\approx}2/2^{256}$ while values in $[2^{256} \bmod q,\, q)$ are sampled with probability ${\approx}1/2^{256}$, breaking the zero-knowledge property of the proofs. To prevent modulo bias, $\mathcal{H}_{\mathsf{scalar}}$ \textbf{must} be implemented by first generating a digest significantly wider than $q$, then reducing. Concretely, either (a) hash to at least 64 bytes using SHA-512 (or BLAKE2b-512) before reducing modulo $q$, or (b) use the \texttt{expand\_message\_xmd} function from RFC 9380 with sufficient output length. Raw \texttt{SHA-256(data) mod q} is explicitly \textbf{prohibited}.
 \end{itemize}
 
 \paragraph{Server Key Generation.}
@@ -524,9 +524,9 @@ The client proves knowledge of a valid daily token on $(c_{\mathsf{bal}}, k_{\ma
 \begin{enumerate}[leftmargin=*]
 \item \textbf{Amount check:} $1 \le s \le 2^{32}-1$.
 \item \textbf{Epoch check:} Disclosed $T$ must be current (with grace period).
-\item \textbf{Idempotency cache check (FIRST):} Compute $h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}(\pi_{\mathsf{spend}} \parallel \eta)$. If $h_{\mathsf{id}}$ is in the idempotency cache, return the cached refund token immediately \textbf{without checking the double-spend database}.
-\item \textbf{Nonce freshness:} Verify that $\eta$ is valid and has not been used before. In standard mode, check a short-lived cache; in high-privacy mode, verify a Merkle inclusion proof and check a Bloom filter.
-\item \textbf{Double-spend check (SECOND):} Atomically check that $k_{\mathsf{cur}} \notin \DB_{\mathsf{spend}}$. \textbf{Reject if $k_{\mathsf{cur}} = 0$}.
+\item \textbf{Idempotency cache check (FIRST):} Compute $h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}(\text{``EBUT:Idempotency:Spend''} \parallel \mathsf{len}(\pi_{\mathsf{spend}}) \parallel \pi_{\mathsf{spend}} \parallel \eta)$. If $h_{\mathsf{id}}$ is in the idempotency cache, return the cached refund token immediately \textbf{without checking the double-spend database}.
+\item \textbf{Nonce read-only check:} Verify that $\eta$ is non-zero, is exactly 16 bytes, and has not yet been marked spent. In standard mode, check a short-lived cache; in high-privacy mode, verify a Merkle inclusion proof and query the exact nonce store. \textbf{Do not mark $\eta$ as spent at this step.}
+\item \textbf{Double-spend read-only check:} Check that $k_{\mathsf{cur}} \notin \DB_{\mathsf{spend}}$. \textbf{Reject if $k_{\mathsf{cur}} = 0$}. \textbf{Do not insert into $\DB_{\mathsf{spend}}$ at this step.}
 \item \textbf{Basic bounds:} $A' \neq 1_{\mathbb{G}_1}$, $T_{\mathsf{BBS}} \neq 1_{\mathbb{G}_1}$.
 \item \textbf{Spend bridge:} $C_{\mathsf{total}} \stackrel{?}{=} K' + s \cdot h_4$.
 \item \textbf{Recompute $c$} from received values.
@@ -543,9 +543,10 @@ The client proves knowledge of a valid daily token on $(c_{\mathsf{bal}}, k_{\ma
   \]
 \item \textbf{BEQ verification:} Verify $\pi_{\text{BEQ\_spend}}$ w.r.t. $C_{\mathsf{BP}}$.
 \item \textbf{Pairing check:} $e(A', \mathsf{pk}_S) = e(\bar{A}, g_2)$.
+\item \textbf{Atomic state mutation (step 14, LAST):} Only after all checks in steps 1--13 pass: atomically insert $k_{\mathsf{cur}}$ into $\DB_{\mathsf{spend}}$ (reject if already present, indicating a concurrent double-spend race); atomically mark $\eta$ as spent in the nonce store. These writes must be performed as a single atomic transaction or with optimistic concurrency control to prevent TOCTOU races.
 \end{enumerate}
 
-If all checks pass, the server issues a refund token by choosing $e^*, s'^* \xleftarrow{\$} \mathbb{Z}_q$ and computing
+If all checks pass and state mutations succeed, the server issues a refund token by choosing $e^*, s'^* \xleftarrow{\$} \mathbb{Z}_q$ and computing
 \[
 A^* = \left( g_1 \cdot K' \cdot h_0^{s'^*} \right)^{\frac{1}{e^* + y}}.
 \]
@@ -632,7 +633,7 @@ and that $m \in [0, 2^{32}-1]$.
 \item \textbf{Challenge:}
   Compute the 128-bit challenge
   \[
-  c = \mathcal{H}_{128}\bigl(\text{ctx} \parallel C_{\text{BLS}} \parallel C_{25519} \parallel R_{\text{BLS}} \parallel R_{25519} \parallel \pi_{\text{range}} \parallel \text{comm}_1 \parallel \dots \parallel \text{comm}_k \bigr).
+  c = \mathcal{H}_{128}\bigl(\text{``EBUT:BEQ:Challenge''} \parallel \text{ctx} \parallel C_{\text{BLS}} \parallel C_{25519} \parallel R_{\text{BLS}} \parallel R_{25519} \parallel \pi_{\text{range}} \parallel \text{comm}_1 \parallel \dots \parallel \text{comm}_k \bigr).
   \]
 
 \item \textbf{Responses:}
@@ -660,7 +661,7 @@ and that $m \in [0, 2^{32}-1]$.
   Verify that $0 \le z < q_{25519}$ (as an integer). If not, reject.
 
 \item \textbf{Recompute Challenge:}
-  Compute $c = \mathcal{H}_{128}(\text{ctx} \parallel C_{\text{BLS}} \parallel C_{25519} \parallel R_{\text{BLS}} \parallel R_{25519} \parallel \pi_{\text{range}} \parallel \text{comm}_1 \parallel \dots)$.
+  Compute $c = \mathcal{H}_{128}(\text{``EBUT:BEQ:Challenge''} \parallel \text{ctx} \parallel C_{\text{BLS}} \parallel C_{25519} \parallel R_{\text{BLS}} \parallel R_{25519} \parallel \pi_{\text{range}} \parallel \text{comm}_1 \parallel \dots)$.
 
 \item \textbf{Verify BLS12-381 Equation:}
   \[
@@ -893,18 +894,19 @@ The hash function $\mathcal{H}_{\mathbb{G}_1}$ should be instantiated using a st
 Network failures and client crashes can lead to retried requests. To prevent double-spend errors and improve user experience, the server must implement idempotency caches.
 
 \paragraph{Refresh Phase Idempotency.}
-When the server issues a Daily Token, it computes a cache key:
+When the server issues a Daily Token, it computes a cache key using a length-prefixed encoding to prevent byte-shifting collisions:
 \[
-\mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}(\pi_{\mathsf{refresh}} \parallel \text{``Idempotency''}),
+\mathtt{key}_{\mathsf{ref}} = \mathcal{H}_{\mathsf{scalar}}\!\left(\text{``EBUT:Idempotency:Refresh''} \parallel \mathsf{len}(\pi_{\mathsf{refresh}}) \parallel \pi_{\mathsf{refresh}} \right),
 \]
-and stores the mapping $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$. The cache entry should persist for the remainder of the epoch (or at least several minutes). If a client resubmits an identical $\pi_{\mathsf{refresh}}$, the server returns the cached response \textbf{without} re-executing the expensive verification (pairings, MSMs) and \textbf{without} re-checking the epoch nullifier in $\DB_{\mathsf{epoch}}$.
+where $\mathsf{len}(\cdot)$ denotes a fixed-width (e.g., 4-byte big-endian) encoding of the byte length of the following field. This length-prefix prevents an adversary from shifting bytes between fields to produce the same concatenated input for different payloads.
+The mapping $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ is stored for the remainder of the epoch (or at least several minutes). If a client resubmits an identical $\pi_{\mathsf{refresh}}$, the server returns the cached response \textbf{without} re-executing the expensive verification (pairings, MSMs) and \textbf{without} re-checking the epoch nullifier in $\DB_{\mathsf{epoch}}$.
 
 \paragraph{Spend Phase Idempotency.}
-For spend requests, the cache key is:
+For spend requests, the cache key uses the same length-prefixed encoding:
 \[
-h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}(\pi_{\mathsf{spend}} \parallel \eta).
+h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}\!\left(\text{``EBUT:Idempotency:Spend''} \parallel \mathsf{len}(\pi_{\mathsf{spend}}) \parallel \pi_{\mathsf{spend}} \parallel \eta \right).
 \]
-The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for a short duration (e.g., 60 seconds). \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database.} If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends.
+The fixed length of $\eta$ (16 bytes) eliminates ambiguity on that side; the length prefix on $\pi_{\mathsf{spend}}$ prevents byte-shifting between the proof and the nonce field. Raw concatenation $\pi_{\mathsf{spend}} \parallel \eta$ without a length delimiter is \textbf{prohibited} because a byte shifted from the end of $\pi_{\mathsf{spend}}$ into $\eta$ yields an identical octet string, mapping two distinct requests to the same cache key. The server stores $h_{\mathsf{id}} \mapsto (A^*, e^*, s'^*)$ for a short duration (e.g., 60 seconds). \textbf{Crucially, the idempotency cache must be checked \emph{before} the double-spend database.} If a match is found, the cached refund token is returned immediately. This prevents legitimate retries from being incorrectly flagged as double spends.
 
 \subsection{API Payload Specification}
 
@@ -979,6 +981,7 @@ Implementers must transmit the public statements alongside the proof. We provide
 \item \textbf{Group Elements:} All $\mathbb{G}_1$ elements must be serialized in \textbf{compressed} form (48 bytes for BLS12-381). Deserialization must validate that the point lies in the prime-order subgroup ($q \cdot P = 1_{\mathbb{G}_1}$) and is canonically encoded.
 \item \textbf{Scalars:} All scalars must be serialized as \textbf{fixed-width 32-byte big-endian} integers. During deserialization, any 32-byte scalar $x$ must be rejected if $x \ge q$ (the group order). This prevents scalar malleability attacks.
 \item \textbf{Domain Separation:} All hash function invocations must be prefixed with a domain separation string (e.g., \texttt{"EBUT:Refresh:v1"}). The context hash $H_{\mathsf{ctx}}$ must be included as the first element in every Fiat--Shamir challenge.
+\item \textbf{Fiat--Shamir Hash Width:} To prevent modulo bias, every use of $\mathcal{H}_{\mathsf{scalar}}$ for Fiat--Shamir challenges \textbf{must} produce an output wider than the field order before reduction. Concretely: use SHA-512 (or BLAKE2b-512) yielding 64 bytes, or use RFC 9380 \texttt{expand\_message\_xmd} with sufficient output length, then reduce the wide integer modulo $q$. Implementing $\mathcal{H}_{\mathsf{scalar}}$ as \texttt{SHA-256(data) mod q} is \textbf{prohibited}.
 \item \textbf{Subgroup Checks:} Every received $\mathbb{G}_1$ element must be validated to lie in the prime-order subgroup to prevent small-subgroup attacks.
 \end{itemize}
 
@@ -987,33 +990,34 @@ Implementers must transmit the public statements alongside the proof. We provide
 The server maintains two logical sets:
 
 \begin{itemize}
-\item $\DB_{\mathsf{epoch}}$: stores compressed $\mathbb{G}_1$ points (48 bytes). Cleared at the start of each epoch.
-\item $\DB_{\mathsf{spend}}$: stores canonical scalars (32 bytes). Cleared at the start of each epoch.
+\item $\DB_{\mathsf{epoch}}$: stores compressed $\mathbb{G}_1$ points (48 bytes). Entries are assigned a TTL of \emph{epoch duration $+$ grace period} at insertion time. \textbf{The database must not be bulk-cleared at the epoch boundary}; individual entries expire after their TTL elapses.
+\item $\DB_{\mathsf{spend}}$: stores canonical scalars (32 bytes). Entries are assigned a TTL of \emph{epoch duration $+$ grace period} at insertion time. \textbf{The database must not be bulk-cleared at the epoch boundary}; individual entries expire after their TTL elapses.
 \end{itemize}
 
 \paragraph{Epoch Grace Period.}
-The server must keep the previous epoch's $\DB_{\mathsf{spend}}$ for a grace period (e.g., 5 minutes) after the epoch boundary. Spend requests with $T_{\mathsf{issue}} = T_{\mathsf{current}} - 1$ during this window are checked against the previous epoch's database. This accommodates clients with slight clock skew or in-flight requests near the boundary.
+\textbf{Critical invariant:} the grace period and database expiry must be consistent. If the server accepts refresh or spend requests for epoch $T-1$ during a grace window of duration $\Delta_{\mathsf{grace}}$ after the start of epoch $T$, then entries written to $\DB_{\mathsf{epoch}}$ and $\DB_{\mathsf{spend}}$ during epoch $T-1$ \emph{must remain readable} for at least $\Delta_{\mathsf{grace}}$ into epoch $T$. Bulk-wiping either database at the epoch boundary while simultaneously accepting grace-period requests creates an exploit window in which an attacker may re-use an epoch-$T{-}1$ nullifier that appears fresh because its record was erased. Concretely, use per-key TTL-based storage: in Redis, store each nullifier as an individual key (e.g., \texttt{SET "epoch:nullifier:\{N\_T\}" 1 EXAT \{epoch\_end + grace\_seconds\}}) so that each entry expires only after the grace window has fully closed, independent of other entries.
 
 \paragraph{Atomicity.}
 All insertions must be conditional and atomic. In SQL, use \texttt{INSERT ... ON CONFLICT DO NOTHING}. In Redis, use \texttt{SETNX}. If an insertion fails due to a duplicate key, the request must be rejected immediately.
 
 \paragraph{High-Velocity Spends.}
-A user may legitimately generate up to $c_{\mathsf{max}}$ spends in a short period. To handle this efficiently without scanning the entire database, the server should use a \textbf{Bloom filter} or \textbf{Cuckoo filter} in front of the main $\DB_{\mathsf{spend}}$ store. The filter is cleared with the database at epoch boundaries. This provides fast, constant-time rejection of duplicates and mitigates resource exhaustion from flood attacks.
+A user may legitimately generate up to $c_{\mathsf{max}}$ spends in a short period. To handle this efficiently, implementers \textbf{must} use an exact, authoritative data structure as the definitive store for $\DB_{\mathsf{spend}}$ and the nonce spent-set. In Redis, store each nullifier as an individual key with a per-key TTL (e.g., \texttt{SET "spend:nullifier:\{k\_cur\}" 1 EX \{ttl\_seconds\}}), which provides $O(1)$ membership tests and per-entry expiry without affecting other entries. A probabilistic structure such as a Bloom filter \textbf{must not} serve as the authoritative store: as the filter fills during an epoch, the false-positive rate rises, causing legitimate spends to be incorrectly rejected. A Bloom filter or Cuckoo filter \emph{may} be placed in front of the exact store as a fast-reject optimisation to avoid unnecessary database lookups for obviously duplicate entries, but any positive result from the filter must be confirmed against the authoritative store before the request is rejected.
 
 \subsection{Verification Order (Optimized)}
 
-To prevent CPU exhaustion attacks from malformed proofs, the server must perform checks in the following order (fastest to slowest):
+To prevent CPU exhaustion attacks from malformed proofs, the server must perform checks in the following order (fastest to slowest). \textbf{All database writes (state mutations) are deferred to the final step and executed only after all cryptographic checks pass.} Performing writes earlier exposes the server to denial-of-service attacks in which an adversary submits a valid nonce with garbage cryptographic proofs, permanently burning the legitimate user's nonce before the proof is validated.
 
 \begin{enumerate}[leftmargin=*]
 \item Epoch and parameter bounds (e.g., $s > 0$, $T$ valid).
 \item \textbf{Idempotency cache check} (return cached token if hit).
-\item Nonce freshness (and Merkle proof if applicable).
-\item Nullifier freshness (atomic DB check) and zero-scalar rejection ($N_T \neq 1_{\mathbb{G}_1}$, $k_{\mathsf{cur}} \neq 0$).
+\item Nonce read-only check (Merkle proof if applicable; \textbf{no write}).
+\item Nullifier read-only check and zero-scalar rejection ($N_T \neq 1_{\mathbb{G}_1}$, $k_{\mathsf{cur}} \neq 0$); \textbf{no write}.
 \item Basic inequality checks ($A' \neq 1_{\mathbb{G}_1}$, $T_{\mathsf{BBS}} \neq 1_{\mathbb{G}_1}$).
 \item Bridge equation checks (additive group operations, fast).
 \item \textbf{Schnorr MSM verification} (BBS+ core without pairing) – $\approx 0.5$ ms.
 \item \textbf{Bulletproof verification} (or BEQ verification) – $\approx 1$--$2$ ms.
 \item \textbf{Bilinear pairing checks} – $\approx 2$--$4$ ms.
+\item \textbf{Atomic state mutation} (insert nullifier into $\DB_{\mathsf{spend}}$, mark nonce as spent; reject on concurrent duplicate).
 \end{enumerate}
 
 \subsection{Edge Cases}
@@ -1029,7 +1033,7 @@ To prevent CPU exhaustion attacks from malformed proofs, the server must perform
 \subsection{Privacy and Operational Considerations}
 
 \paragraph{Transport-Layer Anonymity.}
-The standard nonce acquisition method (\texttt{GET /nonce}) creates a temporal correlation between the client's IP address and the subsequent spend request, breaking anonymity at the network layer. For deployments where transport-layer privacy is critical, implementers \textbf{must} use the high-privacy nonce distribution method: the server periodically publishes a Merkle root of pre-generated nonces. The client selects a nonce, obtains its Merkle inclusion proof, and submits the proof with the spend request. The server verifies the proof and marks the nonce as spent (e.g., in a Bloom filter). This decouples nonce acquisition from spend submission. Because Bloom filters can yield false positives, the client SDK must be prepared to retry with a different nonce upon receiving an HTTP 409 Conflict.
+The standard nonce acquisition method (\texttt{GET /nonce}) creates a temporal correlation between the client's IP address and the subsequent spend request, breaking anonymity at the network layer. For deployments where transport-layer privacy is critical, implementers \textbf{must} use the high-privacy nonce distribution method: the server periodically publishes a Merkle root of pre-generated nonces. The client selects a nonce, obtains its Merkle inclusion proof, and submits the proof with the spend request. The server verifies the proof and, once all cryptographic checks pass, marks the nonce as spent in an \textbf{exact, authoritative store} (e.g., a Redis \texttt{SADD} with TTL-based expiry). This decouples nonce acquisition from spend submission. A probabilistic structure such as a Bloom filter \textbf{must not} be used as the authoritative record of spent nonces: its false-positive rate rises as the epoch progresses, causing legitimate spends to be incorrectly rejected with HTTP 409 Conflict responses. A Bloom filter may be used as a fast-reject layer in front of the authoritative store, but any positive result must be confirmed with an exact lookup before the request is rejected.
 
 \paragraph{Epoch Boundary Burst Capacity.}
 The 5-minute grace period allows a user to hold an unexpired token from the previous epoch while also minting a new token for the current epoch. During this overlap window, the user can spend up to $2 \cdot c_{\mathsf{max}}$ credits. This does not violate the long-term rate limit (one token per epoch), but it does permit a brief localized burst. This trade-off is considered acceptable for fault tolerance. If strict per-minute rate limiting is required, it must be enforced by an external system.
