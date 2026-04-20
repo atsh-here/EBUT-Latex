@@ -342,6 +342,10 @@ At the beginning of epoch $T \le E_{\mathsf{max}}$, the client derives an epoch-
   K_{\mathsf{daily}} = c_{\mathsf{max}} \cdot h_4 + k_{\mathsf{daily}} \cdot h_1 + T \cdot h_2 + r_{\mathsf{daily}} \cdot h_0 \in \mathbb{G}_1.
   \]
   This commitment binds the daily token to epoch $T$, its credit balance $c_{\mathsf{max}}$, and the fresh secret $k_{\mathsf{daily}}$.
+
+  \textbf{Implementation Requirement---Persist Before Sending.}
+  The client \textbf{must} write $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ to local non-volatile storage (e.g., an encrypted on-disk key store or secure enclave) \emph{before} initiating the Refresh network request. If the client application crashes after the server processes the request but before the response arrives, the server's idempotency cache stores the blind signature keyed by $\pi_{\mathsf{refresh}}$, and the epoch nullifier $N_T$ is burned in $\DB_{\mathsf{epoch}}$. Because a rebooted client \emph{cannot} reconstruct the same $\pi_{\mathsf{refresh}}$ without the same $r_{\mathsf{daily}}$ and $k_{\mathsf{daily}}$, it will generate a new commitment $K'_{\mathsf{daily}}$ and a new proof, which will be rejected with HTTP~409 (nullifier already spent). The server's idempotency cache cannot help here: even if the server returned the cached blind signature $(A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$, the client would lack the $r_{\mathsf{daily}}$ required to compute $s_{\mathsf{daily}} = r_{\mathsf{daily}} + s'_{\mathsf{daily}}$, rendering the token cryptographically invalid. Without persisted secrets, the user is permanently locked out for the rest of the epoch. Persisting $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ before the request guarantees that a rebooted client can reconstruct the identical commitment and proof, and the server's idempotency cache will return the cached blind signature, which can then be correctly unblinded.
+
 \item \textbf{Expiry range proof (Cross-Curve BEQ).}
   Compute $\Delta = E_{\mathsf{max}} - T$.
   Choose $r_{\Delta} \xleftarrow{\$} \mathbb{Z}_{q_{\text{BLS}}}$ and $r_{25519}^{(\Delta)} \xleftarrow{\$} \mathbb{Z}_{q_{25519}}$.
@@ -526,7 +530,7 @@ The client proves knowledge of a valid daily token on $(c_{\mathsf{bal}}, k_{\ma
 \item \textbf{Amount check:} $1 \le s \le 2^{32}-1$.
 \item \textbf{Epoch check:} Disclosed $T$ must be current (with grace period).
 \item \textbf{Idempotency cache check (FIRST):} Compute $h_{\mathsf{id}} = \mathcal{H}_{\mathsf{scalar}}(\text{``EBUT:Idempotency:Spend''} \parallel \mathsf{len}(\pi_{\mathsf{spend}}) \parallel \pi_{\mathsf{spend}} \parallel \eta)$. If $h_{\mathsf{id}}$ is in the idempotency cache, return the cached refund token immediately \textbf{without checking the double-spend database}.
-\item \textbf{Nonce read-only check:} Verify that $\eta$ is non-zero, is exactly 16 bytes, and has not yet been marked spent. In standard mode, check a short-lived cache; in high-privacy mode, verify a Merkle inclusion proof and query the exact nonce store. \textbf{Do not mark $\eta$ as spent at this step.}
+\item \textbf{Nonce read-only check:} Verify that $\eta$ is non-zero, is exactly 16 bytes, and has not yet been marked spent. In standard mode, check a short-lived cache against the exact nonce store; in high-privacy ZK-membership mode (see Section~7.10), verify the ZK membership proof against the current Merkle root $\mathsf{rt}$ and check that the leaf nullifier $N_\eta \notin \mathcal{N}_{\mathsf{spent}}$. \textbf{Do not mark $\eta$ (or $N_\eta$) as spent at this step.}
 \item \textbf{Double-spend read-only check:} Check that $k_{\mathsf{cur}} \notin \DB_{\mathsf{spend}}$. \textbf{Reject if $k_{\mathsf{cur}} = 0$}. \textbf{Do not insert into $\DB_{\mathsf{spend}}$ at this step.}
 \item \textbf{Basic bounds:} $A' \neq 1_{\mathbb{G}_1}$, $T_{\mathsf{BBS}} \neq 1_{\mathbb{G}_1}$.
 \item \textbf{Spend bridge:} $C_{\mathsf{total}} \stackrel{?}{=} K' + s \cdot h_4$.
@@ -637,13 +641,24 @@ and that $m \in [0, 2^{32}-1]$.
   The expected number of iterations is less than~2; rejection occurs with probability at most $(2^{32}-1) \cdot (2^{128}-1) / 2^{240} < 2^{-80}$, where $c_{\max} \le 2^{32}-1$ per Section~4.1 and $c < 2^{128}$.
 
 \item \textbf{Range Proof:}
-  Generate a Dalek Bulletproof $\pi_{\text{range}}$ for the Ristretto commitment $C_{25519}$ proving that $m \in [0, 2^{32}-1]$. The Bulletproof transcript is initialized with domain separator \texttt{"EBUT:BEQ:Range"} and includes $\text{ctx}$ and the serialized auxiliary commitments $\text{comm}_i$.
+  Generate a Dalek Bulletproof $\pi_{\text{range}}$ for the Ristretto commitment $C_{25519}$ proving that $m \in [0, 2^{32}-1]$. The Bulletproof transcript is initialized with domain separator \texttt{"EBUT:BEQ:Range"} and includes $\mathsf{len}(\text{ctx}) \parallel \text{ctx}$ followed by $\mathsf{len}(\text{comm}_i) \parallel \text{comm}_i$ for each auxiliary commitment, using the same length-prefixed encoding mandated for the Fiat--Shamir challenge below.
 
 \item \textbf{Challenge:}
-  Compute the 128-bit challenge
+  Compute the 128-bit challenge using length-prefixed encoding for all variable-length fields to prevent byte-shifting transcript collisions (the same requirement mandated for the idempotency cache in Section~7.4):
   \[
-  c = \mathcal{H}_{128}\bigl(\text{``EBUT:BEQ:Challenge''} \parallel \text{ctx} \parallel C_{\text{BLS}} \parallel C_{25519} \parallel R_{\text{BLS}} \parallel R_{25519} \parallel \pi_{\text{range}} \parallel \text{comm}_1 \parallel \dots \parallel \text{comm}_k \bigr).
+  c = \mathcal{H}_{128}\!\left(
+  \begin{array}{l}
+  \text{``EBUT:BEQ:Challenge''} \parallel
+  \mathsf{len}(\text{ctx}) \parallel \text{ctx} \parallel
+  C_{\text{BLS}} \parallel C_{25519} \parallel
+  R_{\text{BLS}} \parallel R_{25519} \parallel
+  \mathsf{len}(\pi_{\text{range}}) \parallel \pi_{\text{range}} \parallel \\
+  \mathsf{len}(\text{comm}_1) \parallel \text{comm}_1 \parallel \dots \parallel
+  \mathsf{len}(\text{comm}_k) \parallel \text{comm}_k
+  \end{array}
+  \right),
   \]
+  where $\mathsf{len}(\cdot)$ denotes a fixed-width 4-byte big-endian encoding of the byte length of the following field. The curve group elements $C_{\text{BLS}}$, $C_{25519}$, $R_{\text{BLS}}$, $R_{25519}$ are always fixed size (48, 32, 48, and 32 bytes respectively) and do not require length prefixes; however, $\text{ctx}$, $\pi_{\text{range}}$, and each $\text{comm}_i$ are variable-length and \textbf{must} be length-prefixed. Raw concatenation of variable-length fields without delimiters is \textbf{prohibited}: an attacker can shift bytes between adjacent variable-length fields to produce an identical transcript hash for two distinct proof statements, breaking binding.
 
 \item \textbf{Responses:}
   Use the $z = u_m + c \cdot m$ accepted in step~1 (over the integers, not reduced modulo any group order).
@@ -667,7 +682,20 @@ and that $m \in [0, 2^{32}-1]$.
   Verify that $0 \le z \le 2^{240}-1$ (as an integer). If not, reject. This tighter bound (compared to checking only $z < q_{25519}$, where $q_{25519} \approx 2^{252}$) is enforced by the prover's rejection-sampling step and is required for the zero-knowledge guarantee: without it, a large $z > 2^{240}-1$ would reveal that $c \cdot m$ is large, leaking a lower bound on the secret $m$.
 
 \item \textbf{Recompute Challenge:}
-  Compute $c = \mathcal{H}_{128}(\text{``EBUT:BEQ:Challenge''} \parallel \text{ctx} \parallel C_{\text{BLS}} \parallel C_{25519} \parallel R_{\text{BLS}} \parallel R_{25519} \parallel \pi_{\text{range}} \parallel \text{comm}_1 \parallel \dots)$.
+  Compute $c$ using the identical length-prefixed encoding as the prover:
+  \[
+  c = \mathcal{H}_{128}\!\left(
+  \begin{array}{l}
+  \text{``EBUT:BEQ:Challenge''} \parallel
+  \mathsf{len}(\text{ctx}) \parallel \text{ctx} \parallel
+  C_{\text{BLS}} \parallel C_{25519} \parallel
+  R_{\text{BLS}} \parallel R_{25519} \parallel
+  \mathsf{len}(\pi_{\text{range}}) \parallel \pi_{\text{range}} \parallel \\
+  \mathsf{len}(\text{comm}_1) \parallel \text{comm}_1 \parallel \dots \parallel
+  \mathsf{len}(\text{comm}_k) \parallel \text{comm}_k
+  \end{array}
+  \right).
+  \]
 
 \item \textbf{Verify BLS12-381 Equation:}
   \[
@@ -907,6 +935,9 @@ When the server issues a Daily Token, it computes a cache key using a length-pre
 where $\mathsf{len}(\cdot)$ denotes a fixed-width (e.g., 4-byte big-endian) encoding of the byte length of the following field. This length-prefix prevents an adversary from shifting bytes between fields to produce the same concatenated input for different payloads.
 The mapping $\mathtt{key}_{\mathsf{ref}} \mapsto (A_{\mathsf{daily}}, e_{\mathsf{daily}}, s'_{\mathsf{daily}})$ is stored for the remainder of the epoch (or at least several minutes). If a client resubmits an identical $\pi_{\mathsf{refresh}}$, the server returns the cached response \textbf{without} re-executing the expensive verification (pairings, MSMs) and \textbf{without} re-checking the epoch nullifier in $\DB_{\mathsf{epoch}}$.
 
+\textbf{Limitation: idempotency cache cannot recover from client-side state loss.}
+The server's idempotency cache protects against \emph{network-layer} retries where the client retransmits the same proof. It does \emph{not} protect against the case where the client crashes and loses volatile state (RAM) between generating the commitment and receiving the server response. In that scenario the rebooted client lacks $r_{\mathsf{daily}}$ and $k_{\mathsf{daily}}$ and must generate a \emph{new} $K_{\mathsf{daily}}$ and a new $\pi_{\mathsf{refresh}}$. The new proof hashes to a different $\mathtt{key}_{\mathsf{ref}}$, so the server bypasses the cache, hits $\DB_{\mathsf{epoch}}$, finds $N_T$ already burned, and rejects the request---permanently locking the user out for the epoch. Even if the server keyed the cache by $N_T$ and returned the old blind signature, the client cannot use it without $r_{\mathsf{daily}}$. \textbf{The only robust defence is the client-side persistence requirement stated in Section~4.3.1}: the client must durably persist $k_{\mathsf{daily}}$ and $r_{\mathsf{daily}}$ before initiating the network request.
+
 \paragraph{Spend Phase Idempotency.}
 For spend requests, the cache key uses the same length-prefixed encoding:
 \[
@@ -1040,7 +1071,18 @@ To prevent CPU exhaustion attacks from malformed proofs, the server must perform
 \subsection{Privacy and Operational Considerations}
 
 \paragraph{Transport-Layer Anonymity.}
-The standard nonce acquisition method (\texttt{GET /nonce}) creates a temporal correlation between the client's IP address and the subsequent spend request, breaking anonymity at the network layer. For deployments where transport-layer privacy is critical, implementers \textbf{must} use the high-privacy nonce distribution method: the server periodically publishes a Merkle root of pre-generated nonces. The client selects a nonce, obtains its Merkle inclusion proof, and submits the proof with the spend request. The server verifies the proof and, once all cryptographic checks pass, marks the nonce as spent in an \textbf{exact, authoritative store} (e.g., a Redis \texttt{SADD} with TTL-based expiry). This decouples nonce acquisition from spend submission. A probabilistic structure such as a Bloom filter \textbf{must not} be used as the authoritative record of spent nonces: its false-positive rate rises as the epoch progresses, causing legitimate spends to be incorrectly rejected with HTTP 409 Conflict responses. A Bloom filter may be used as a fast-reject layer in front of the authoritative store, but any positive result must be confirmed with an exact lookup before the request is rejected.
+The standard nonce acquisition method (\texttt{GET /nonce}) creates a temporal correlation between the client's IP address and the subsequent spend request, breaking anonymity at the network layer. For deployments where transport-layer privacy is critical, \textbf{the Merkle-root nonce distribution method described in some earlier drafts of this specification must not be used}: it introduces a targeted de-anonymization attack. In that approach, a malicious or compromised server acts as a fingerprint oracle---it distributes different Merkle trees (or different sub-trees) to different IP addresses or geographic regions. When the client later submits a spend request containing the plaintext nonce $\eta$ and its Merkle branch, the server trivially identifies which IP address downloaded that particular branch, perfectly linking the anonymous spend to the requesting client. Because the branch is a unique, server-controlled artifact, no amount of proof work by the client prevents this mapping.
+
+Two sound alternatives exist:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{ZK-membership with leaf nullifier (recommended for high-privacy deployments).}
+    The server publishes a Merkle root $\mathsf{rt}$ of a set of nonces. The client selects a leaf $\eta_i$ and its inclusion path \emph{offline} (e.g., from a previously cached full tree or via an anonymous channel). When spending, instead of revealing $\eta_i$ and its path, the client proves in zero-knowledge that $\eta_i$ is a member of the tree under $\mathsf{rt}$, and derives a deterministic leaf nullifier $N_\eta = \mathcal{H}_{\mathbb{G}_1}(\text{``EBUT:LeafNullifier:''} \parallel \eta_i)$ which is submitted in place of $\eta$. The server checks $N_\eta \notin \mathcal{N}_{\mathsf{spent}}$ and verifies the ZK membership proof against $\mathsf{rt}$, then marks $N_\eta$ as spent. This completely decouples the identity of the leaf from the spend submission. The membership proof can be constructed using a standard Merkle-Schnorr ZK argument or a succinct proof system (e.g., a Merkle proof inside a Bulletproof/STARK circuit).
+  \item \textbf{Anonymous-network nonce retrieval (simplest deployment).}
+    The client fetches the nonce via Tor, a mixnet, or another anonymous transport before initiating the spend. The standard \texttt{GET /nonce} flow is used, but the network-layer identity is unlinkable from the spend submission. No changes to the cryptographic protocol are required.
+\end{enumerate}
+
+Deployments \textbf{must} choose one of these two options when transport-layer unlinkability is required. Raw Merkle-inclusion-proof submission of plaintext nonces is \textbf{prohibited} in privacy-sensitive deployments.
 
 \paragraph{Epoch Boundary Burst Capacity.}
 The 5-minute grace period allows a user to hold an unexpired token from the previous epoch while also minting a new token for the current epoch. During this overlap window, the user can spend up to $2 \cdot c_{\mathsf{max}}$ credits. This does not violate the long-term rate limit (one token per epoch), but it does permit a brief localized burst. This trade-off is considered acceptable for fault tolerance. If strict per-minute rate limiting is required, it must be enforced by an external system.
